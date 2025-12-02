@@ -1,0 +1,6 @@
+# ví dụ
+.venv/
+__pycache__/
+*.log
+*.env
+data/
