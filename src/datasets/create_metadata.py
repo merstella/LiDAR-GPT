@@ -1,92 +1,77 @@
 import json
 import os
+import sys
 from nuscenes.nuscenes import NuScenes
 from datasets import load_dataset
-import sys
+
 def create_unified_metadata(
     nusc_root, 
     nusc_qa_path, 
     output_path="unified_nuscenes_infos.json"
 ):
     print("Loading nuScenes DB...")
-    # Khởi tạo nuScenes devkit để tra cứu đường dẫn file từ token
-    # TODO: Edit the correct version
+    # Khởi tạo nuScenes devkit
     nusc = NuScenes(version='v1.0-mini', dataroot=nusc_root, verbose=True)
     
     unified_data = []
 
     # --- 1. Xử lý NuCaption (Captioning Task) ---
     print("Processing NuCaption...")
-    # Tải trực tiếp từ Hugging Face
-    ds_caption = load_dataset("Senqiao/LiDAR-LLM-Nu-Caption", split="train")
-    
-    for item in ds_caption:
-        token = item['sample_token']
-        
-        # Lấy thông tin LiDAR path và Sweeps từ nuScenes SDK
-        try:
-            lidar_info = get_lidar_info(nusc, token)
-        except KeyError:
-            continue # Bỏ qua nếu token không khớp với version nuScenes hiện tại
+    try:
+        ds_caption = load_dataset("Senqiao/LiDAR-LLM-Nu-Caption", split="train")
+        for item in ds_caption:
+            token = item['sample_token']
             
-        unified_data.append({
-            "task": "caption",
-            "sample_token": token,
-            "lidar_path": lidar_info['filename'],
-            "ego_pose": lidar_info['ego_pose'],
-            "sweeps": lidar_info['sweeps'],
-            # Dùng answer_lidar để tránh ảo giác màu sắc
-            "instruction": item['question'],
-            "answer": item['answer_lidar'] 
-        })
+            try:
+                lidar_info = get_lidar_info(nusc, token)
+            except KeyError:
+                continue 
+                
+            unified_data.append({
+                "task": "caption",
+                "sample_token": token,
+                "lidar_path": lidar_info['filename'],
+                "ego_pose": lidar_info['ego_pose'],
+                "calibrated_sensor": lidar_info['calibrated_sensor'], 
+                "sweeps": lidar_info['sweeps'],
+                "instruction": item['question'],
+                "answer": item['answer_lidar'] 
+            })
+    except Exception as e:
+        print(f"Skipping NuCaption due to error or missing data: {e}")
 
     # --- 2. Xử lý NuScenes-QA (QA Task) ---
     print("Processing NuScenes-QA...")
     
-    # Load file json QA (Cấu trúc bạn vừa gửi)
-    with open(nusc_qa_path, 'r') as f:
-        qa_raw_data = json.load(f) 
-    
-    # LƯU Ý: Dữ liệu nằm trong key "questions"
-    qa_list = qa_raw_data['questions'] 
+    if os.path.exists(nusc_qa_path):
+        with open(nusc_qa_path, 'r') as f:
+            qa_raw_data = json.load(f) 
+        
+        qa_list = qa_raw_data['questions'] 
+        print(f"Found {len(qa_list)} QA pairs.")
 
-    print(f"Found {len(qa_list)} QA pairs.")
-
-    for item in qa_list:
-        # Lấy sample_token
-        token = item['sample_token']
-        origin_stdout = sys.stdout
-        try:
-            # Tra cứu thông tin LiDAR từ token bằng nuScenes SDK
-            lidar_info = get_lidar_info(nusc, token)
-            with open("output.txt", "w", encoding="utf-8") as f:
-                sys.stdout = f
-                print(lidar_info)
-                print()
-
-        except KeyError:
-            # Bỏ qua nếu token không tìm thấy trong version nuScenes đang dùng (mini/trainval)
-            continue
-        sys.stdout = origin_stdout
-        unified_data.append({
-            "task": "qa",
-            "id": f"qa_{token}_{len(unified_data)}", # Tạo ID duy nhất nếu cần debug
-            "sample_token": token,
+        for item in qa_list:
+            token = item['sample_token']
+            try:
+                lidar_info = get_lidar_info(nusc, token)
+            except KeyError:
+                continue
             
-            # Thông tin để load Point Cloud
-            "lidar_path": lidar_info['filename'],
-            "ego_pose": lidar_info['ego_pose'],
-            "sweeps": lidar_info['sweeps'],
-            
-            # Thông tin Input/Output cho mô hình
-            # QA instruction: template + câu hỏi
-            "instruction": item['question'], 
-            "answer": item['answer'],
-            
-            # Lưu thêm metadata (để sau này đánh giá model theo độ khó)
-            "meta_hop": item.get('num_hop'),
-            "meta_type": item.get('template_type')
-        })
+            unified_data.append({
+                "task": "qa",
+                "id": f"qa_{token}_{len(unified_data)}",
+                "sample_token": token,
+                "lidar_path": lidar_info['filename'],
+                "ego_pose": lidar_info['ego_pose'],
+                "calibrated_sensor": lidar_info['calibrated_sensor'], 
+                "sweeps": lidar_info['sweeps'],
+                "instruction": item['question'], 
+                "answer": item['answer'],
+                "meta_hop": item.get('num_hop'),
+                "meta_type": item.get('template_type')
+            })
+    else:
+        print(f"Warning: QA path {nusc_qa_path} not found.")
 
     # --- 3. Lưu file tổng hợp ---
     print(f"Saving {len(unified_data)} samples to {output_path}...")
@@ -94,37 +79,45 @@ def create_unified_metadata(
         json.dump(unified_data, f, indent=2)
 
 def get_lidar_info(nusc, sample_token):
-    """Hàm phụ trợ lấy đường dẫn LiDAR và 10 frame cũ (sweeps)"""
+    """Hàm phụ trợ lấy đường dẫn LiDAR, Pose và Calibration"""
     sample = nusc.get('sample', sample_token)
     lidar_token = sample['data']['LIDAR_TOP']
     lidar_data = nusc.get('sample_data', lidar_token)
+    
+    # 1. Lấy Ego Pose (Vị trí xe vs Global)
     ego_pose = nusc.get('ego_pose', lidar_data['ego_pose_token'])
     
-    # Lấy danh sách sweeps (ngược thời gian)
+    # 2. Lấy Calibrated Sensor (Vị trí Lidar vs Xe) 
+    calib_sensor = nusc.get('calibrated_sensor', lidar_data['calibrated_sensor_token'])
+    
+    # Lấy danh sách sweeps
     sweeps = []
     curr_sd_rec = lidar_data
     
-    # Lấy 10 frame cũ hơn
     for _ in range(10):
         if curr_sd_rec['prev'] == '':
             break
         curr_sd_rec = nusc.get('sample_data', curr_sd_rec['prev'])
+        
+        sweep_ego = nusc.get('ego_pose', curr_sd_rec['ego_pose_token'])
+        sweep_calib = nusc.get('calibrated_sensor', curr_sd_rec['calibrated_sensor_token'])
+        
         sweeps.append({
             "lidar_path": curr_sd_rec['filename'],
-            "ego_pose": nusc.get('ego_pose', curr_sd_rec['ego_pose_token'])
+            "ego_pose": sweep_ego,
+            "calibrated_sensor": sweep_calib 
         })
         
     return {
         "filename": lidar_data['filename'],
         "ego_pose": ego_pose,
+        "calibrated_sensor": calib_sensor, 
         "sweeps": sweeps
     }
 
-# --- Chạy script ---
 if __name__ == "__main__":
-    # Thay đường dẫn thực tế của bạn vào đây
+    # Đảm bảo đường dẫn này đúng trên máy bạn
     create_unified_metadata(
-        nusc_root="./data/nuscenes",
+        nusc_root="./data/nuscenes", 
         nusc_qa_path="./data/nuscenesQA/NuScenes_train_questions.json"
     )
-    # load_caption()
