@@ -141,7 +141,6 @@ class LiDARGPTDataset(Dataset):
                 # 4. Cập nhật lại XYZ mới vào sweep_points
                 sweep_points[:, :3] = points_transformed[:, :3]
                 
-                
                 all_points_list.append(sweep_points)
                 
         return np.concatenate(all_points_list, axis=0)
@@ -262,19 +261,6 @@ if __name__ == "__main__":
     print(f"🚀 Bắt đầu Sanity Check...")
     print(f"📂 Data Root: {DATA_ROOT}")
     print(f"📄 Ann File: {ANN_FILE}")
-
-    # 1. Thử khởi tạo Dataset
-    try:
-        dataset = LiDARGPTDataset(
-            data_root=DATA_ROOT,
-            ann_file=ANN_FILE,
-            n_points=10000,
-            n_sweeps=3,
-        )
-        print(f"✅ Khởi tạo thành công! Tổng số mẫu: {len(dataset)}")
-    except Exception as e:
-        print(f"❌ Lỗi khởi tạo: {e}")
-        sys.exit(1)
 
     try:
         # Thử với n_sweeps=10 để kiểm tra accumulation
