@@ -10,7 +10,7 @@ class LiDARGPTDataset(Dataset):
     def __init__(self, data_root, ann_file, n_points=10000, n_sweeps=10):
         """
         Khởi tạo Dataset cho MiniGPT-3D sử dụng dữ liệu nuScenes.
-
+        sadfsdf
         Args:
             data_root (str): Đường dẫn gốc tới folder chứa dữ liệu nuScenes (raw data).
                              Ví dụ: '/data/nuscenes'
@@ -73,30 +73,31 @@ class LiDARGPTDataset(Dataset):
         info = self.data_infos[index]
         
         # 1. Load Frame Hiện tại (Reference)
-        ref_points = self.load_pc(info['lidar_path'])
-        # Thêm time_lag = 0
-        ref_points = np.hstack([ref_points, np.zeros((ref_points.shape[0], 1), dtype=np.float32)])
+        # ref_points shape: (N, 4) gồm [x, y, z, intensity]
+        ref_points = self.load_pc(info['lidar_path']) 
         
-        # --- CHUẨN BỊ MA TRẬN CHO REF FRAME ---
-        # Ref Lidar -> Ref Ego
+        # --- CHUẨN BỊ MA TRẬN CHO REF FRAME (NGHỊCH ĐẢO) ---
+        # Mục tiêu: Tạo ma trận chuyển từ Global -> Ref Lidar
+        # Logic: P_ref_lidar = inv(Ref_Lidar->Ref_Ego) * inv(Ref_Ego->Global) * P_global
+        
+        # Lấy thông tin
         ref_calib = info['calibrated_sensor']
-        ref_lidar2ego = self.get_matrix(ref_calib)
-        
-        # Ref Ego -> Global
         ref_pose = info['ego_pose']
+        
+        # Tạo ma trận thuận
+        ref_lidar2ego = self.get_matrix(ref_calib)
         ref_ego2global = self.get_matrix(ref_pose)
         
-        # Tính ma trận đảo: Global -> Ref Lidar 
-        # (Global -> Ego -> Lidar) = inv(Ref Ego -> Global) * inv(Ref Lidar -> Ref Ego)
+        # Tính ma trận nghịch đảo
         ref_global2ego = np.linalg.inv(ref_ego2global)
         ref_ego2lidar = np.linalg.inv(ref_lidar2ego)
         
-        # Gom lại: Global -> Ref Lidar
+        # Gom lại thành một ma trận duy nhất: Global -> Ref Lidar
         global2ref_lidar = np.dot(ref_ego2lidar, ref_global2ego)
-
+        
         all_points_list = [ref_points]
 
-        # 2. Loop Sweeps
+        # 2. Loop Sweeps (Các frame quá khứ)
         if 'sweeps' in info:
             for i, sweep in enumerate(info['sweeps']):
                 if i >= self.n_sweeps: break
@@ -104,37 +105,42 @@ class LiDARGPTDataset(Dataset):
                 sweep_points = self.load_pc(sweep['lidar_path'])
                 if sweep_points.shape[0] == 0: continue
                 
-                # --- CHUYỂN HỆ TỌA ĐỘ SWEEP ---
-                # A. Sweep Lidar -> Sweep Ego
-                sweep_calib = sweep['calibrated_sensor']
-                sweep_lidar2ego = self.get_matrix(sweep_calib)
+                # --- CHUYỂN HỆ TỌA ĐỘ SWEEP (THUẬN) ---
+                # Mục tiêu: Tạo ma trận chuyển từ Sweep Lidar -> Global
+                # Logic: P_global = Sweep_Ego->Global * Sweep_Lidar->Sweep_Ego * P_sweep_lidar
                 
-                # B. Sweep Ego -> Global
+                sweep_calib = sweep['calibrated_sensor']
                 sweep_pose = sweep['ego_pose']
+                
+                sweep_lidar2ego = self.get_matrix(sweep_calib)
                 sweep_ego2global = self.get_matrix(sweep_pose)
                 
-                # C. Tổng hợp: Sweep Lidar -> Global
+                # Gom lại thành một ma trận duy nhất: Sweep Lidar -> Global
                 sweep_lidar2global = np.dot(sweep_ego2global, sweep_lidar2ego)
                 
-                # D. Tổng hợp cuối cùng: Sweep Lidar -> Ref Lidar
-                # P_ref = (Global -> Ref Lidar) * (Sweep Lidar -> Global) * P_sweep
+                # --- TỔNG HỢP: SWEEP LIDAR -> REF LIDAR ---
+                # Công thức: P_ref = (Global -> Ref) * (Sweep -> Global) * P_sweep
                 transform_matrix = np.dot(global2ref_lidar, sweep_lidar2global)
                 
-                # Thực hiện biến đổi nhân ma trận
-                # Points: (N, 3) -> Thêm cột 1 -> (N, 4) để nhân với ma trận 4x4
+                # --- THỰC HIỆN NHÂN MA TRẬN ---
+                # 1. Lấy XYZ: (N, 3)
                 points_xyz = sweep_points[:, :3]
                 num_points = points_xyz.shape[0]
+                
+                # 2. Chuyển sang tọa độ đồng nhất (Homogeneous coordinates): (N, 4)
+                # Thêm cột số 1 vào cuối: [x, y, z] -> [x, y, z, 1]
                 points_homo = np.hstack([points_xyz, np.ones((num_points, 1))])
                 
-                # Nhân: (4, 4) . (4, N) -> (4, N) -> Transpose lại thành (N, 4)
+                # 3. Nhân ma trận:
+                # transform_matrix: (4, 4)
+                # points_homo.T: (4, N) -> Chuyển vị để nhân cột
+                # Kết quả dot: (4, N)
+                # .T cuối cùng: Chuyển vị ngược lại thành (N, 4)
                 points_transformed = np.dot(transform_matrix, points_homo.T).T
                 
-                # Cập nhật lại XYZ mới
+                # 4. Cập nhật lại XYZ mới vào sweep_points
                 sweep_points[:, :3] = points_transformed[:, :3]
                 
-                # Thêm Time lag
-                time_lag = np.ones((sweep_points.shape[0], 1), dtype=np.float32) * (i + 1)
-                sweep_points = np.hstack([sweep_points, time_lag])
                 
                 all_points_list.append(sweep_points)
                 
@@ -219,7 +225,7 @@ class LiDARGPTDataset(Dataset):
         # B. Lọc nhiễu không gian
         # Hàm này trả về numpy array (M, 5)
         filtered_points = self.filter_range(raw_points)
-        
+
         # C. Chuẩn hóa theo Uni3D (Quan trọng nhất)
         # Hàm này trả về numpy array (10000, 6) gồm [x, y, z, 0.4, 0.4, 0.4]
         processed_points = self.uni3d_process(filtered_points)
@@ -263,77 +269,99 @@ if __name__ == "__main__":
             data_root=DATA_ROOT,
             ann_file=ANN_FILE,
             n_points=10000,
-            n_sweeps=10
+            n_sweeps=3,
         )
         print(f"✅ Khởi tạo thành công! Tổng số mẫu: {len(dataset)}")
     except Exception as e:
         print(f"❌ Lỗi khởi tạo: {e}")
         sys.exit(1)
 
-    # 2. Lấy thử mẫu đầu tiên
     try:
-        sample = dataset[0]
-        pc = sample['pc']
-        instr = sample['instruction_input']
-        ans = sample['answer']
-        token = sample['PC_id']
+        # Thử với n_sweeps=10 để kiểm tra accumulation
+        dataset = LiDARGPTDataset(
+            data_root=DATA_ROOT,
+            ann_file=ANN_FILE,
+            n_points=10000,
+            n_sweeps=3,
+        )
+        print(f"✅ Khởi tạo thành công! Tổng số mẫu: {len(dataset)}")
+    except Exception as e:
+        print(f"❌ Lỗi khởi tạo: {e}")
+        sys.exit(1)
 
-        print("\n--- 🔍 Kiểm tra Mẫu số 0 ---")
-        print(f"🆔 Token ID: {token}")
-        
-        # 3. Check Point Cloud Shape
-        # Kỳ vọng: [10000, 6] (XYZ + RGB giả)
-        print(f"📦 PC Shape: {pc.shape}")
-        if pc.shape == (10000, 6):
-            print("   ✅ Shape chuẩn (10k điểm, 6 kênh).")
+    # 2. Lấy thử mẫu đầu tiên và Debug Visualize
+    try:
+        if len(dataset) > 0:
+            # Chọn index mẫu để kiểm tra (ví dụ index 0)
+            sample_idx = 0
+            sample = dataset[sample_idx]
+            
+            # Lấy thông tin metadata để in ra đường dẫn gốc
+            meta_info = dataset.data_infos[sample_idx]
+            raw_lidar_path = os.path.join(DATA_ROOT, meta_info['lidar_path'])
+            
+            pc = sample['pc']
+            instr = sample['instruction_input']
+            ans = sample['answer']
+            token = sample['PC_id']
+
+            print(f"\n--- 🔍 Kiểm tra Mẫu số {sample_idx} ---")
+            print(f"🆔 Token ID: {token}")
+            print(f"📂 Raw LiDAR Path: {raw_lidar_path}") # <-- In đường dẫn gốc ở đây
+            
+            # 3. Check Point Cloud Shape
+            print(f"📦 PC Shape: {pc.shape}")
+            if pc.shape == (10000, 6):
+                print("   ✅ Shape chuẩn (10k điểm, 6 kênh).")
+            else:
+                print(f"   ⚠️ Cảnh báo: Shape lạ, kỳ vọng (10000, 6).")
+
+            # 4. Check Normalization
+            xyz = pc[:, :3]
+            max_val = torch.max(xyz).item()
+            min_val = torch.min(xyz).item()
+            print(f"📊 PC Range (XYZ): Min={min_val:.4f}, Max={max_val:.4f}")
+            
+            if -1.1 <= min_val and max_val <= 1.1:
+                print("   ✅ Normalization có vẻ đúng (nằm trong Unit Sphere).")
+            else:
+                print("   ⚠️ Cảnh báo: Giá trị vượt quá [-1, 1], kiểm tra lại logic normalize.")
+
+            # 5. Check Instruction
+            print(f"📝 Instruction: \"{instr}\"")
+            if "<PC><PointCloudHere></PC>" in instr:
+                print("   ✅ Format chuẩn MiniGPT-3D.")
+            
+            print(f"🗣️ Answer: \"{ans}\"")
+            print("\n🎉 CHÚC MỪNG! Dataset Class hoạt động ổn định.")
+            
+            # --- OPEN3D VISUALIZATION ---
+            try:
+                import open3d as o3d
+                print("\n🎨 Đang hiển thị Point Cloud (Cửa sổ 3D sẽ hiện ra)...")
+                print(f"👉 Dữ liệu này được load từ file gốc: {meta_info['lidar_path']}")
+                print(f"👉 Đã qua xử lý: Accumulate (10 sweeps) -> Filter Range -> Normalize")
+                
+                # Lấy xyz từ tensor
+                xyz = pc[:, :3].numpy()
+                
+                # Tạo object Open3D
+                pcd = o3d.geometry.PointCloud()
+                pcd.points = o3d.utility.Vector3dVector(xyz)
+                
+                # Thêm trục tọa độ để dễ nhìn (Red=X, Green=Y, Blue=Z)
+                axes = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5, origin=[0, 0, 0])
+                
+                # Hiển thị
+                o3d.visualization.draw_geometries([pcd, axes], window_name=f"Check Normalize - {token}")
+                print("✅ Visualize xong. Nếu thấy đám mây điểm hình cầu nằm gọn quanh gốc tọa độ là đúng!")
+                
+            except ImportError:
+                print("⚠️ Chưa cài open3d nên không visualize được. (pip install open3d)")
         else:
-            print(f"   ⚠️ Cảnh báo: Shape lạ, kỳ vọng (10000, 6).")
-
-        # 4. Check Normalization
-        # Kỳ vọng: Giá trị nằm trong khoảng [-1, 1] (hoặc lân cận)
-        xyz = pc[:, :3]
-        max_val = torch.max(xyz).item()
-        min_val = torch.min(xyz).item()
-        print(f"📊 PC Range (XYZ): Min={min_val:.4f}, Max={max_val:.4f}")
-        
-        if -1.1 <= min_val and max_val <= 1.1:
-            print("   ✅ Normalization có vẻ đúng (nằm trong Unit Sphere).")
-        else:
-            print("   ⚠️ Cảnh báo: Giá trị vượt quá [-1, 1], kiểm tra lại logic normalize.")
-
-        # 5. Check Instruction Format
-        print(f"📝 Instruction: \"{instr}\"")
-        if "<PC><PointCloudHere></PC>" in instr:
-            print("   ✅ Format chuẩn MiniGPT-3D.")
-        else:
-            print("   ❌ Lỗi: Thiếu thẻ <PC>... trong instruction!")
-
-        print(f"🗣️ Answer: \"{ans}\"")
-
-        print("\n🎉 CHÚC MỪNG! Dataset Class hoạt động ổn định.")
+            print("Dataset rỗng! Kiểm tra lại file json.")
 
     except Exception as e:
         print(f"\n❌ Lỗi khi lấy mẫu: {e}")
         import traceback
         traceback.print_exc()
-
-    try:
-        import open3d as o3d
-        print("\n🎨 Đang hiển thị Point Cloud (Cửa sổ 3D sẽ hiện ra)...")
-        
-        # Lấy xyz từ tensor
-        xyz = pc[:, :3].numpy()
-        
-        # Tạo object Open3D
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(xyz)
-        
-        # Thêm trục tọa độ để dễ nhìn (Red=X, Green=Y, Blue=Z)
-        axes = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5, origin=[0, 0, 0])
-        
-        # Hiển thị
-        o3d.visualization.draw_geometries([pcd, axes], window_name="Check Normalize")
-        print("✅ Visualize xong. Nếu thấy đám mây điểm hình cầu nằm gọn quanh gốc tọa độ là đúng!")
-        
-    except ImportError:
-        print("⚠️ Chưa cài open3d nên không visualize được. (pip install open3d)")
